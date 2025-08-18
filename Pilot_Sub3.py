@@ -313,6 +313,14 @@ class World(object):
             print(f"[PHYS] Drag coefficient tuned for smoother coasting: {phys.drag_coefficient:.3f}")
         except Exception:
             pass
+        # ▶ 스폰 직후 Drive(1단)로 세팅해 '기어>=1' 조건을 즉시 만족
+        try:
+            self.player.apply_control(carla.VehicleControl(
+                throttle=0.0, brake=0.0, hand_brake=False, gear=1
+            ))
+            print("[INIT] Set initial gear=1 (Drive) for creep.")
+        except Exception:
+            pass
 
         self.setup_navigation()
 
@@ -1563,6 +1571,10 @@ class DualControl(object):
         if isinstance(world.player, carla.Vehicle):
             self._control = carla.VehicleControl()
             world.player.set_autopilot(self._autopilot_enabled)
+            # ▶ 시작부터 Drive 모드 보장
+            self._control.manual_gear_shift = False   # 자동 변속 유지(기어 필드는 로직 게이트용)
+            self._control.gear = 1
+            self._control.reverse = False
         elif isinstance(world.player, carla.Walker):
             self._control = carla.WalkerControl()
             self._autopilot_enabled = False
@@ -1599,16 +1611,31 @@ class DualControl(object):
         self._wiper_level = 0  # 0: OFF, 1: LOW, 2: MEDIUM, 3: HIGH
         self._l3_button_prev = False
 
+        # ── 페달 데드존(노이즈 무시)
+        self._throttle_deadzone = 0.02
+        self._brake_deadzone    = 0.08   # G29 캘리브가 약간 올라오는 경우 대비
+
         # --- Coast/Hold (quasi-cruise) state ---
         self._prev_throttle_raw = 0.0
         self._coast_hold_active = False
         self._coast_target_kph = 0.0
         self._coast_until_wall = 0.0
         # Tunables
-        self._coast_min_throttle = 0.15   # baseline torque to overcome drag
-        self._coast_kp = 0.05             # throttle per km/h error
-        self._coast_max_throttle = 0.4   # safety cap
-        self._coast_hold_seconds = 50.0   # hold duration after pedal release
+        self._coast_min_throttle = 0.15
+        self._coast_kp = 0.05
+        self._coast_max_throttle = 0.40
+        self._coast_hold_seconds = 50.0
+
+        # --- Creep (idle crawl like real AT car) ---
+        self._creep_enabled = True
+        self._creep_target_kph = 8.0       # ← 원하면 4~10으로 조절
+        self._creep_min_throttle = 0.08    # ↑ 정지 마찰/구름저항을 확실히 극복
+        self._creep_kp = 0.05              # ↑ 목표보다 느리면 더 민첩하게 받쳐줌
+        self._creep_max_throttle = 0.30
+        self._creep_deadband_kph = 0.05
+        # 정지 탈출 킥(anti-stiction): 완전 정지 근처에서 잠깐 힘줘 출발
+        self._creep_kick_throttle = 0.18   # 18% 이상 주입
+        self._creep_kick_kph = 0.5         # 0.5 km/h 미만일 때 킥
 
 
     def parse_events(self, world, clock):
@@ -1794,18 +1821,25 @@ class DualControl(object):
         # ---- Coast/Hold logic (keeps speed when you release the pedal)
         raw_throttle = throttleCmd
         raw_brake = brakeCmd
+        thr_off = (raw_throttle < self._throttle_deadzone)
+        brk_off = (raw_brake    < self._brake_deadzone)
 
         # Detect throttle release (pressed -> released)
-        just_released = (self._prev_throttle_raw > 0.05 and raw_throttle < 0.02)
+        just_released = (self._prev_throttle_raw > 0.05 and thr_off)
 
         now_wall = time.time()
         try:
             v = self._world.player.get_velocity()
             speed_kph = 3.6 * math.sqrt(v.x*v.x + v.y*v.y + v.z*v.z)
+            # 전/후 진행 부호가 있는 "전방 속도" (후진 롤백 보정용)
+            fwd = self._world.player.get_transform().get_forward_vector()
+            spd_signed = (v.x*fwd.x + v.y*fwd.y + v.z*fwd.z)  # m/s (전방 +, 후방 -)
+            spd_signed_kph = 3.6 * spd_signed
         except Exception:
             speed_kph = 0.0
+            spd_signed_kph = 0.0
 
-        if just_released and raw_brake < 0.02:
+        if just_released and brk_off:
             # Hold current speed (clamped) or at least 20 km/h (creep preference)
             target = max(20.0, min(speed_kph, 60.0))
             self._coast_target_kph = target
@@ -1813,7 +1847,7 @@ class DualControl(object):
             self._coast_until_wall = now_wall + self._coast_hold_seconds
 
         # Cancel coast when user intervenes or timer ends
-        if raw_throttle > 0.02 or raw_brake > 0.02 or now_wall > self._coast_until_wall:
+        if (not thr_off) or (not brk_off) or (now_wall > self._coast_until_wall):
             self._coast_hold_active = False
 
         inj = 0.0
@@ -1823,9 +1857,24 @@ class DualControl(object):
                 inj = self._coast_min_throttle + self._coast_kp * err
                 inj = max(0.0, min(self._coast_max_throttle, inj))
 
-        # Final brake/throttle with coast injection
+        # --- Creep injection (only when no pedal & no brake & gear >= 1) ---
+        creep_inj = 0.0
+        if (self._creep_enabled
+            and thr_off and brk_off
+            and not self._control.reverse
+            and getattr(self._control, "gear", 0) >= 1):
+            # 목표보다 느리거나(정지 포함) 후방으로 밀리면(언덕 롤백) 앞으로 밀어줌
+            err_c = self._creep_target_kph - spd_signed_kph  # 전방 기준 오차
+            if err_c > self._creep_deadband_kph:
+                creep_inj = self._creep_min_throttle + self._creep_kp * err_c
+                creep_inj = max(0.0, min(self._creep_max_throttle, creep_inj))
+            # 정지 탈출 킥: 아주 느리면 잠깐 크게 밀어 초기 가속 확보
+            if speed_kph < self._creep_kick_kph:
+                creep_inj = max(creep_inj, self._creep_kick_throttle)
+
+        # Final brake/throttle with both injections
         self._control.brake = raw_brake
-        self._control.throttle = max(raw_throttle, inj)
+        self._control.throttle = max(raw_throttle, inj, creep_inj)
 
         # Remember for next frame
         self._prev_throttle_raw = raw_throttle
